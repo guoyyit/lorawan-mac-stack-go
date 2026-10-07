@@ -38,15 +38,20 @@ func (d *Device) tx(ctx context.Context, mt lorawan.MType, payload []byte, needA
 		}
 
 		raw := sharedRaw
-		// Counter is reserved and persisted before transmit: a crash wastes
-		// one counter value but never reuses it. Duty-cycle admission comes
-		// first so a rejected/limited send never consumes a counter.
-		if _, err := d.duty.Reserve(ctx, time.Now(), d.cfg.Airtime); err != nil {
-			return err
-		}
 		if raw == nil {
+			// Validate length/shape before anything is admitted or reserved:
+			// an oversize or otherwise invalid send must not consume
+			// duty-cycle budget, a frame counter or pending ACK/MAC state.
+			if err := d.validateFrame(mt, payload); err != nil {
+				return err
+			}
+			// Duty-cycle admission precedes counter reservation, so a limited
+			// send consumes no counter.
+			if _, err := d.duty.Reserve(ctx, time.Now(), d.cfg.Airtime); err != nil {
+				return err
+			}
 			var err error
-			_, raw, err = d.buildFrame(ctx, mt, payload)
+			_, raw, err = d.sealFrame(ctx, mt, payload)
 			if err != nil {
 				return err
 			}
@@ -85,7 +90,25 @@ func (d *Device) tx(ctx context.Context, mt lorawan.MType, payload []byte, needA
 	return lastErr
 }
 
-func (d *Device) buildFrame(ctx context.Context, mt lorawan.MType, payload []byte) (*lorawan.Frame, []byte, error) {
+// validateFrame checks join state and the local frame size cap without
+// mutating any state. It is the no-side-effect gate for Send* calls.
+func (d *Device) validateFrame(mt lorawan.MType, payload []byte) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.session.Joined {
+		return errors.New("device: not joined")
+	}
+	optsLen := len(d.pendingLinkADRAns)
+	if optsLen > 255 || len(payload) > lorawan.MaxPayload ||
+		optsLen+len(payload) > lorawan.MaxFrameBody-lorawan.MaxFrameHeader {
+		return lorawan.ErrFrameTooLong
+	}
+	return nil
+}
+
+// sealFrame reserves and persists one uplink counter and encodes the frame.
+// validateFrame must have succeeded and duty-cycle admission passed first.
+func (d *Device) sealFrame(ctx context.Context, mt lorawan.MType, payload []byte) (*lorawan.Frame, []byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.session.Joined {
@@ -118,13 +141,23 @@ func (d *Device) buildFrame(ctx context.Context, mt lorawan.MType, payload []byt
 	return f, raw, nil
 }
 
-// handleDown validates the downlink counter, processes MAC commands and
-// delivers application payload at most once per counter value.
+// handleDown validates the downlink counter, durably advances FCntDown,
+// processes MAC commands and delivers application payload at most once per
+// counter value. The advanced downlink floor is persisted BEFORE any other
+// side effect: if the process restarts after having received a downlink, the
+// floor never rolls back and that downlink cannot be accepted (and delivered)
+// a second time.
 func (d *Device) handleDown(ctx context.Context, f *lorawan.Frame) {
 	var appData []byte
 	d.mu.Lock()
 	if err := d.session.AcceptDown(f.FCnt); err != nil {
 		// Duplicate/replay: drop silently (already delivered/ACKed).
+		d.mu.Unlock()
+		return
+	}
+	if err := d.persistLocked(ctx); err != nil {
+		// Durability failure: do not process or deliver this frame; the
+		// in-memory floor still prevents a second acceptance in this run.
 		d.mu.Unlock()
 		return
 	}

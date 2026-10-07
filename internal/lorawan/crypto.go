@@ -65,11 +65,14 @@ func dirByte(down bool) byte {
 }
 
 // computeMIC returns the first 4 bytes of AES-CMAC(key, B0|msg), using the
-// LoRaWAN B0 block (direction, DevAddr, full 32-bit frame counter).
-func computeMIC(key AESKey, addr DevAddr, down bool, fcnt uint32, msg []byte) [4]byte {
-	if len(msg) > 255 {
-		// The B0 length field is one byte; the local wire format guarantees this.
-		panic("lorawan: frame too long for MIC")
+// LoRaWAN B0 block (direction, DevAddr, full 32-bit frame counter). The
+// authenticated body must be at most 255 bytes (one-byte B0 length field);
+// EncodeFrame/DecodeFrame guarantee this, and an oversize body returns an
+// error instead of panicking.
+func computeMIC(key AESKey, addr DevAddr, down bool, fcnt uint32, msg []byte) ([4]byte, error) {
+	var mic [4]byte
+	if len(msg) > MaxFrameBody {
+		return mic, ErrFrameTooLong
 	}
 	var b0 [16]byte
 	b0[0] = 0x49
@@ -81,9 +84,8 @@ func computeMIC(key AESKey, addr DevAddr, down bool, fcnt uint32, msg []byte) [4
 	combined = append(combined, b0[:]...)
 	combined = append(combined, msg...)
 	mac := aesCMAC(key, combined)
-	var mic [4]byte
 	copy(mic[:], mac[:4])
-	return mic
+	return mic, nil
 }
 
 // joinMIC computes AES-CMAC(AppKey, full-frame-bytes).

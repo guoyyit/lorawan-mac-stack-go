@@ -123,12 +123,25 @@ func DecodeJoinAccept(appKey AESKey, raw []byte) (*JoinAccept, error) {
 //	last 4  NwkSKey MIC over all preceding bytes
 
 // EncodeFrame serializes, encrypts and signs a data frame for the session.
+// It never allocates for oversized input: length validation happens before any
+// buffer is built and an oversize frame returns ErrFrameTooLong without
+// touching counters or session state (the caller owns those).
 func EncodeFrame(s *Session, f *Frame) ([]byte, error) {
 	if s == nil || f == nil {
 		return nil, ErrMalformed
 	}
-	if len(f.FOpts) > 255 || len(f.Payload) > 65535 {
+	if f.MType != MTypeUnconfirmedDataUp && f.MType != MTypeUnconfirmedDataDown &&
+		f.MType != MTypeConfirmedDataUp && f.MType != MTypeConfirmedDataDown {
 		return nil, ErrMalformed
+	}
+	optsLen := len(f.FOpts)
+	payloadLen := len(f.Payload)
+	if optsLen > 255 || payloadLen > MaxPayload {
+		return nil, ErrFrameTooLong
+	}
+	// The authenticated body is the 14-byte header plus both variable fields.
+	if optsLen+payloadLen > MaxFrameBody-MaxFrameHeader {
+		return nil, ErrFrameTooLong
 	}
 	port := byte(0)
 	if f.HasPort {
@@ -145,7 +158,7 @@ func EncodeFrame(s *Session, f *Frame) ([]byte, error) {
 		ctl |= ctlFPort
 	}
 
-	out := make([]byte, 0, 14+len(f.FOpts)+len(f.Payload)+4)
+	out := make([]byte, 0, MaxFrameHeader+optsLen+payloadLen+4)
 	out = append(out, byte(f.MType), ctl)
 	out = append(out, f.DevAddr[:]...)
 	out = appendU32LE(out, f.FCnt)
@@ -157,12 +170,19 @@ func EncodeFrame(s *Session, f *Frame) ([]byte, error) {
 	if len(f.Payload) > 0 {
 		out = append(out, encryptPayload(payloadKey(s, port), f.DevAddr, down, f.FCnt, port, f.Payload)...)
 	}
-	mic := computeMIC(s.NwkSKey, f.DevAddr, down, f.FCnt, out)
+	mic, err := computeMIC(s.NwkSKey, f.DevAddr, down, f.FCnt, out)
+	if err != nil {
+		return nil, err
+	}
 	return append(out, mic[:]...), nil
 }
 
 // DecodeFrame parses, verifies and decrypts a data frame for the session.
-// On any structural or integrity failure it returns an error and no state.
+// On any structural, length or integrity failure it returns a distinguishable
+// error and no state. It never panics and never performs an allocation
+// proportional to attacker-controlled length fields: the total raw length is
+// capped at MaxFrameLength before those fields are trusted, and variable
+// fields are copied only after the declared lengths match the frame exactly.
 func DecodeFrame(s *Session, raw []byte) (*Frame, error) {
 	if s == nil || len(raw) < 18 {
 		return nil, ErrMalformed
@@ -172,7 +192,19 @@ func DecodeFrame(s *Session, raw []byte) (*Frame, error) {
 		mt != MTypeConfirmedDataUp && mt != MTypeConfirmedDataDown {
 		return nil, ErrMalformed
 	}
+	// Reject oversize input up front, independently of the declared length
+	// fields, so a huge length field can never drive a huge allocation and no
+	// crypto work is spent on it.
+	if len(raw) > MaxFrameLength {
+		return nil, ErrFrameTooLong
+	}
 	ctl := raw[1]
+	optsLen := int(raw[10])
+	payloadLen := int(readU16LE(raw[11:13]))
+	end := MaxFrameHeader + optsLen + payloadLen
+	if end+4 != len(raw) {
+		return nil, ErrMalformed
+	}
 	f := &Frame{
 		MType:   mt,
 		DevAddr: DevAddr(raw[2:6]),
@@ -182,24 +214,22 @@ func DecodeFrame(s *Session, raw []byte) (*Frame, error) {
 		HasPort: ctl&ctlFPort != 0,
 		FPort:   raw[13],
 	}
-	optsLen := int(raw[10])
-	payloadLen := int(readU16LE(raw[11:13]))
-	end := 14 + optsLen + payloadLen
-	if end+4 != len(raw) {
-		return nil, ErrMalformed
-	}
-	f.FOpts = append([]byte(nil), raw[14:14+optsLen]...)
+	f.FOpts = append([]byte(nil), raw[MaxFrameHeader:MaxFrameHeader+optsLen]...)
 	down := f.IsDown()
 	var mic [4]byte
 	copy(mic[:], raw[end:end+4])
-	if computeMIC(s.NwkSKey, f.DevAddr, down, f.FCnt, raw[:end]) != mic {
+	gotMIC, err := computeMIC(s.NwkSKey, f.DevAddr, down, f.FCnt, raw[:end])
+	if err != nil {
+		return nil, err
+	}
+	if gotMIC != mic {
 		return nil, ErrBadMIC
 	}
 	if f.DevAddr != s.DevAddr {
 		return nil, ErrNoSession
 	}
 	if payloadLen > 0 {
-		cipher := raw[14+optsLen : end]
+		cipher := raw[MaxFrameHeader+optsLen : end]
 		f.Payload = encryptPayload(payloadKey(s, f.FPort), f.DevAddr, down, f.FCnt, f.FPort, cipher)
 	}
 	return f, nil

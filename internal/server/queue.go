@@ -20,6 +20,11 @@ func (s *Server) EnqueueConfirmedDown(devEUI lorawan.EUI, payload []byte) error 
 }
 
 func (s *Server) enqueue(devEUI lorawan.EUI, q queuedDown) error {
+	// Reject oversize payloads at the API boundary with a distinguishable
+	// error: nothing is queued, no counter is reserved, no state changes.
+	if len(q.payload) > lorawan.MaxPayload {
+		return lorawan.ErrFrameTooLong
+	}
 	st := s.sessions[lorawan.EUIHex(devEUI)]
 	if st == nil {
 		return lorawan.ErrUnknownDevice

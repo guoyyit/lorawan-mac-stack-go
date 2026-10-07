@@ -119,6 +119,10 @@ func New(cfg Config) (*Device, error) {
 }
 
 func (d *Device) onAir(raw []byte) {
+	// The codec rejects every malformed/oversize input with an error, but a
+	// receiver must never let a bad frame crash the process regardless: any
+	// unexpected panic is contained and the frame is simply discarded.
+	defer func() { _ = recover() }()
 	d.mu.Lock()
 	sess := d.session
 	joined := sess.Joined

@@ -38,6 +38,39 @@ go run ./cmd/demo
 The demo writes JSON session files to a temp directory (removed on exit) and
 logs every phase. Tests create their own temp directories via `t.TempDir()`.
 
+## Hardening tests added in this iteration
+
+All tests are local, deterministic and use the in-memory radio with
+`t.TempDir()` stores — no external services, real network or real credentials:
+
+* `internal/lorawan/frame_limit_test.go`: a frame **exactly at**
+  `MaxFrameLength` (payload-only and FOpts+payload variants) encodes, decodes
+  and verifies; one byte over and a 1 MiB payload are rejected with
+  `ErrFrameTooLong` on encode; a one-byte-over and a 1 MiB raw frame, plus a
+  frame whose length fields lie about its size, are classified correctly on
+  decode (`ErrFrameTooLong` vs `ErrMalformed`) without panic or large
+  allocation; the error is asserted distinct from bad-MIC/replay/overflow.
+* `internal/device/uplink_test.go`: an oversize uplink returns
+  `ErrFrameTooLong` and consumes no `FCntUp` and no pending ACK/MAC state.
+* `internal/integration/malformed_isolation_test.go`: a device continuously
+  injecting one-byte-over, far-oversize and structurally malformed frames
+  leaves the server alive and other devices' joins/confirmed uplinks/downlinks
+  unblocked and un-cross-talked; an oversize `EnqueueDown` is rejected without
+  touching counters while a following legal downlink still flows; a concurrent
+  four-healthy-device scenario verifies per-device 4/4 delivery and counters
+  alongside the faulty peer.
+* `internal/integration/downlink_recovery_test.go`: after a device receives a
+  downlink, restarts from its on-disk store (server stays up), its `FCntDown`
+  does not roll back and the server's subsequent application downlinks and a
+  LinkADRReq MAC command are still received, each payload exactly once.
+
+Run them (with the race detector, repeated for timing stability) via:
+
+```sh
+go test -race ./...
+go test -race -run 'Frame|Oversize|Malformed|ConcurrentFaulty|DownlinkSurvives' ./internal/...
+```
+
 ## Configuration
 
 `device.Config` (see `internal/device/device.go`):
@@ -103,6 +136,48 @@ logs every phase. Tests create their own temp directories via `t.TempDir()`.
   A bad MIC, truncated frame, or length mismatch returns `ErrBadMIC`/
   `ErrMalformed`; the frame is discarded and counted as bad **without touching
   counters or session state** — no panic, no state pollution.
+
+#### Maximum frame length and oversize-input semantics
+
+The authenticated body of a data frame carries a one-byte length field in the
+MIC `B0` block (`B0[15]`), so that body cannot exceed 255 bytes. Combined with
+the fixed 14-byte header and the 4-byte MIC the local format therefore defines
+these hard limits (exported from `internal/lorawan`):
+
+| Constant | Value | Meaning |
+| --- | --- | --- |
+| `MaxFrameHeader` | 14 | Fixed header bytes (`MType … FPort`) |
+| `MaxFrameBody` | 255 | Authenticated body: header + FOpts + payload |
+| `MaxFrameLength` | 259 | Total on-the-wire data-frame length (body + 4-byte MIC) |
+| `MaxPayload` | 241 | Maximum application payload when no FOpts are present |
+
+FOpts and payload share the 241 variable bytes (`len(FOpts)+len(Payload) ≤
+241`). These are local-format limits, not LoRaWAN PHY payload limits, and are
+chosen because the MIC construction authenticates the whole pre-MIC body with
+a single length byte.
+
+* A frame **exactly equal** to the limit encodes, decodes and passes its
+  integrity check normally.
+* Anything longer is rejected deterministically with **`ErrFrameTooLong`**,
+  which is intentionally distinct from `ErrBadMIC` (integrity failure),
+  `ErrReplay`/`ErrDuplicate` (counter replay) and `ErrCounterOverflow`
+  (counter exhaustion), so callers can branch on the cause.
+* The guarantee holds in **both directions** — `EncodeFrame` and
+  `DecodeFrame` — and on both the device and the server. Length is checked
+  before any buffer allocation and before length fields are trusted, so an
+  advertised 64 KiB/1 MiB payload cannot drive a matching allocation
+  ("no runaway memory allocation"); decode never slices beyond the raw input.
+* **Rejected frames have no side effects.** A rejected send consumes no frame
+  counter (length validation precedes both duty-cycle admission and counter
+  reservation), changes no session or pending-ACK/MAC state, and leaves
+  nothing partially queued. A rejected receive advances no counter, pollutes
+  no session and delivers nothing to the application. `EnqueueDown` rejects
+  oversize payloads at the API boundary with the same error.
+* The server additionally bounds raw input at its transport edge
+  (`MaxFrameLength`), isolates each device on its own serialized worker, and
+  recovers from an unexpected panic while processing a frame, so a device
+  continuously injecting oversize/garbage frames cannot crash the server or
+  affect any other device's joins or traffic.
 * **Overflow:** counters are 32-bit. `0xFFFFFFFF` is the last legal value;
   reserving past it returns `ErrCounterOverflow` and latches persisted
   `UpExhausted/DownExhausted` flags. No further frames are sent or accepted
@@ -147,6 +222,13 @@ logs every phase. Tests create their own temp directories via `t.TempDir()`.
   sending the ACK; the device reserves `FCntUp` before transmitting. After both
   sides restart, each resumes from durable counters and never accepts a value
   below its floor.
+* **Downlink counters are crash-recovered too.** As soon as a device accepts a
+  downlink it advances **and persists `FCntDown` before** processing MAC
+  commands or delivering application payload. If the device restarts after a
+  downlink, the downlink floor never rolls back: the server's subsequent
+  application data and MAC commands (sent at the next counters) are still
+  received, while the already-used counter cannot be accepted or delivered a
+  second time. The server has always persisted `FCntDown` when reserving it.
 * **State divergence policy:** counters only move forward. A stale frame is
   rejected as replay/duplicate; the application sees each frame once. If the
   persistent state is irrecoverably out of sync (e.g. one side lost its store),

@@ -141,8 +141,19 @@ func New(cfg Config) (*Server, error) {
 }
 
 // onAir dispatches a raw frame to the owning device's inbox. It never blocks:
-// an overloaded device's frames are dropped at its own queue boundary.
-func (s *Server) onAir(raw []byte) {
+// an overloaded device's frames are dropped at its own queue boundary, and it
+// never panics: an oversize or malformed frame is discarded at the edge so a
+// hostile device cannot exhaust memory or crash the dispatcher (which serves
+// every device), and no other device's traffic is affected.
+func (s *Server) onAir(rawIn []byte) {
+	defer func() { _ = recover() }()
+	// Hard edge bound: no legal frame in the local format can exceed this;
+	// reject before copying or consulting length fields, so an advertised
+	// multi-megabyte frame cannot drive a matching allocation.
+	if len(rawIn) == 0 || len(rawIn) > lorawan.MaxFrameLength {
+		return
+	}
+	raw := append([]byte(nil), rawIn...)
 	id := s.route(raw)
 	if id == "" {
 		return
@@ -152,7 +163,7 @@ func (s *Server) onAir(raw []byte) {
 		return
 	}
 	select {
-	case st.inbox <- append([]byte(nil), raw...):
+	case st.inbox <- raw:
 	default:
 		st.mu.Lock()
 		st.droppedQueue++

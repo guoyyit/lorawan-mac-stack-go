@@ -16,9 +16,21 @@ func (s *Server) peerLoop(st *peerState) {
 		case <-s.closed:
 			return
 		case raw := <-st.inbox:
-			s.handleFrame(st, raw)
+			s.safeHandleFrame(st, raw)
 		}
 	}
+}
+
+// safeHandleFrame contains any unexpected panic while processing one frame:
+// a malformed or hostile frame kills neither the per-device worker nor the
+// server process, and can never affect another device's serialized worker.
+func (s *Server) safeHandleFrame(st *peerState, raw []byte) {
+	defer func() {
+		if recover() != nil {
+			s.countBad(st)
+		}
+	}()
+	s.handleFrame(st, raw)
 }
 
 func (s *Server) handleFrame(st *peerState, raw []byte) {

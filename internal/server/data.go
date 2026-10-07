@@ -83,12 +83,39 @@ func (s *Server) prepareDownLocked(st *peerState, up *lorawan.Frame) (*lorawan.F
 		return nil, false
 	}
 
+	// Stage the variable fields and validate the local size cap BEFORE any
+	// queue pop or counter reservation, so an oversize combination has no
+	// side effects. If the queued payload plus a pending LinkADRReq would
+	// overflow the frame, send the MAC command alone in this window and keep
+	// the payload queued for the next one (the ACK is still sent); neither a
+	// counter nor a queue item is lost to the length rejection.
+	var nextPayload []byte
+	var opts []byte
+	if hasQueue {
+		nextPayload = st.downQ[0].payload
+	}
+	if hasADR {
+		opts = append(opts, lorawan.CIDLinkADRReq)
+		opts = append(opts, lorawan.MarshalLinkADRReq(st.linkADR.dr, st.linkADR.txPower)...)
+	}
+	sendPayload := hasQueue
+	if len(opts)+len(nextPayload) > lorawan.MaxFrameBody-lorawan.MaxFrameHeader {
+		if hasADR {
+			nextPayload = nil
+			sendPayload = false
+		} else {
+			// Payload alone is oversize (EnqueueDown normally rejects this);
+			// do not pop it or reserve a counter.
+			return nil, false
+		}
+	}
+
 	down := &lorawan.Frame{
 		DevAddr: st.session.DevAddr,
 		ACK:     needACK,
 	}
 	content := false
-	if hasQueue {
+	if sendPayload {
 		first := st.downQ[0]
 		st.downQ = st.downQ[1:]
 		if first.confirmed {
@@ -98,14 +125,13 @@ func (s *Server) prepareDownLocked(st *peerState, up *lorawan.Frame) (*lorawan.F
 		}
 		down.HasPort = true
 		down.FPort = 1
-		down.Payload = append([]byte(nil), first.payload...)
+		down.Payload = append([]byte(nil), nextPayload...)
 		content = true
 	} else {
 		down.MType = lorawan.MTypeUnconfirmedDataDown
 	}
 	if hasADR {
-		down.FOpts = append(down.FOpts, lorawan.CIDLinkADRReq)
-		down.FOpts = append(down.FOpts, lorawan.MarshalLinkADRReq(st.linkADR.dr, st.linkADR.txPower)...)
+		down.FOpts = opts
 		st.linkADR = nil
 		content = true
 	}

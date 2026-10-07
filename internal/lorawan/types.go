@@ -42,10 +42,35 @@ const (
 	CIDDevStatusAns = 0x06
 )
 
+// Single data-frame size limit (see wire.go for the layout):
+//
+//	14 fixed header bytes + FOpts + encrypted Payload + 4 MIC bytes.
+//
+// The MIC construction authenticates the whole pre-MIC body with a one-byte
+// length field (B0[15]), so that body must not exceed 255 bytes. Hence:
+//
+//	MaxFrameBody   = 255 (header + FOpts + payload, authenticated bytes)
+//	MaxFrameLength = 259 (body + 4 MIC bytes, total on-the-wire length)
+//	MaxPayload     = 241 (payload when no FOpts are present)
+//
+// A frame exactly at these limits is legal; anything longer is rejected
+// deterministically with ErrFrameTooLong (distinct from ErrBadMIC,
+// ErrReplay/ErrDuplicate and ErrCounterOverflow) in both encode and decode.
+const (
+	MaxFrameHeader = 14 // MType..FPort header, including the FPort byte
+	MaxFrameBody   = 255
+	MaxFrameLength = MaxFrameBody + 4 // + MIC
+	MaxPayload     = MaxFrameBody - MaxFrameHeader
+)
+
 // Protocol errors. They are deterministic and stable for callers/tests.
 var (
 	// ErrMalformed is returned for truncated or structurally invalid frames.
 	ErrMalformed = errors.New("lorawan: malformed frame")
+	// ErrFrameTooLong is returned for a data frame that exceeds MaxFrameLength.
+	// It is deliberately distinct from integrity, replay and overflow errors so
+	// callers can tell oversize input apart from those rejections.
+	ErrFrameTooLong = errors.New("lorawan: frame exceeds maximum length")
 	// ErrBadMIC is returned when the integrity check fails.
 	ErrBadMIC = errors.New("lorawan: bad MIC")
 	// ErrReplay is returned for frames with a frame counter below the replay floor.
