@@ -21,6 +21,14 @@ func (d *Device) SendConfirmed(ctx context.Context, payload []byte) error {
 }
 
 func (d *Device) tx(ctx context.Context, mt lorawan.MType, payload []byte, needACK bool) error {
+	// Length is validated before ANY side effect: an oversize payload is
+	// rejected without consuming duty budget, a frame counter, or changing
+	// session/pending state. buildFrame re-checks under the lock before
+	// reserving the counter, so the guarantee holds even if pending MAC
+	// responses appear concurrently.
+	if err := d.checkPayloadSize(payload); err != nil {
+		return err
+	}
 	attempts := 1
 	if needACK {
 		attempts += d.cfg.Retries
@@ -85,11 +93,25 @@ func (d *Device) tx(ctx context.Context, mt lorawan.MType, payload []byte, needA
 	return lastErr
 }
 
+// checkPayloadSize rejects payloads that can never fit in one frame. It is a
+// pure read: no counter, budget or session state is touched.
+func (d *Device) checkPayloadSize(payload []byte) error {
+	d.mu.Lock()
+	fOptsLen := len(d.pendingLinkADRAns)
+	d.mu.Unlock()
+	return lorawan.ValidateBodySize(fOptsLen, len(payload))
+}
+
 func (d *Device) buildFrame(ctx context.Context, mt lorawan.MType, payload []byte) (*lorawan.Frame, []byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if !d.session.Joined {
 		return nil, nil, errors.New("device: not joined")
+	}
+	// Authoritative size check under the lock, BEFORE the counter is
+	// reserved and persisted: a rejected send leaves no trace behind.
+	if err := lorawan.ValidateBodySize(len(d.pendingLinkADRAns), len(payload)); err != nil {
+		return nil, nil, err
 	}
 	fcnt, err := d.session.ReserveUp()
 	if err != nil {
@@ -131,6 +153,17 @@ func (d *Device) handleDown(ctx context.Context, f *lorawan.Frame) {
 	d.processFOptsLocked(ctx, f.FOpts)
 	if f.MType == lorawan.MTypeConfirmedDataDown {
 		d.pendingACK = true
+	}
+	// The accepted downlink counter (and any ACK obligation) must be durable
+	// BEFORE delivery. Otherwise a restart rolls FCntDown back while the
+	// server has already advanced, and every later downlink would be
+	// rejected as replay -- the downlink path would never recover.
+	if err := d.persistLocked(ctx); err != nil {
+		// Not durable: drop instead of delivering. Delivery without a
+		// persisted counter could replay the payload to the application
+		// after a restart; at-most-once takes precedence.
+		d.mu.Unlock()
+		return
 	}
 	if len(f.Payload) > 0 && d.cfg.OnAppData != nil {
 		appData = append([]byte(nil), f.Payload...)

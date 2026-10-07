@@ -108,6 +108,35 @@ logs every phase. Tests create their own temp directories via `t.TempDir()`.
   `UpExhausted/DownExhausted` flags. No further frames are sent or accepted
   until a fresh OTAA join resets the session.
 
+### Frame size limits
+
+* **Maximum frame size is `lorawan.MaxFrameSize` = 259 bytes** on the wire
+  (14-byte header + up to 241 body bytes + 4-byte MIC). The basis: the MIC is
+  computed over a B0 block whose length field is a single byte, so the signed
+  portion of a frame may not exceed 255 bytes; 255 + 4 MIC bytes = 259.
+* **Maximum application payload is `lorawan.MaxPayloadSize` = 241 bytes** with
+  empty FOpts; every FOpts byte reduces it one-for-one
+  (`14 + len(FOpts) + len(Payload) + 4 ≤ 259`, see `lorawan.ValidateBodySize`).
+* A frame at **exactly** the limit encodes, decodes and verifies normally.
+* Anything larger is rejected deterministically with
+  **`lorawan.ErrFrameTooLarge`**, which is distinct from `ErrBadMIC`
+  (integrity failure), `ErrMalformed` (structural corruption),
+  `ErrReplay`/`ErrDuplicate` (counter reuse) and `ErrCounterOverflow`
+  (counter space exhausted), so callers can tell a length rejection apart
+  from every other failure mode.
+* The limit is enforced in **both directions**:
+  * *Encoding:* `EncodeFrame` refuses oversize FOpts+payload before allocating
+    or signing. The device checks length **before** duty-cycle admission and
+    **before** reserving/persisting a frame counter, and the server checks at
+    `EnqueueDown` — a rejected send consumes no counter, no duty budget, no
+    queue slot and leaves no pending state behind.
+  * *Decoding:* `DecodeFrame` checks the total length **first**, before any
+    allocation or cryptography proportional to the claimed length. An
+    oversize frame therefore cannot trigger unbounded memory allocation, and
+    a rejected frame never advances a frame counter, never touches session
+    state and never delivers partial content to the application. No illegal
+    input — oversize, truncated or malformed — can crash either process.
+
 ### Adaptive data rate
 
 * The server commands rate/power with a **LinkADRReq** MAC command carried in
@@ -147,6 +176,14 @@ logs every phase. Tests create their own temp directories via `t.TempDir()`.
   sending the ACK; the device reserves `FCntUp` before transmitting. After both
   sides restart, each resumes from durable counters and never accepts a value
   below its floor.
+* **The downlink direction is covered symmetrically:** the device persists
+  `FCntDown` (and any pending ACK obligation) immediately after accepting a
+  downlink and *before* delivering the payload to the application. A restart
+  therefore never rolls the downlink floor back, never re-uses a downlink
+  counter, and the server's next application downlink or MAC command is still
+  accepted after the restart. If the persist fails the frame is dropped
+  instead of delivered — at-most-once delivery takes precedence, so the
+  application can never see the same payload twice.
 * **State divergence policy:** counters only move forward. A stale frame is
   rejected as replay/duplicate; the application sees each frame once. If the
   persistent state is irrecoverably out of sync (e.g. one side lost its store),
@@ -167,3 +204,36 @@ logs every phase. Tests create their own temp directories via `t.TempDir()`.
 `internal/lorawan/crypto_test.go` verifies the AES-CMAC implementation against
 RFC 4493 vectors, the join MIC against a worked example, and key derivation /
 payload CTR round-trips against independently computed values.
+
+## Robustness verification
+
+* `internal/lorawan/limits_test.go` — frame-size boundaries: a frame at
+  exactly `MaxFrameSize` round-trips (with and without FOpts); encoding one
+  byte over and far over the limit returns `ErrFrameTooLarge`; decoding
+  frames at `MaxFrameSize+1`, a declared-65535-payload frame that really is
+  that long, and multi-MiB buffers all return `ErrFrameTooLarge` without
+  panic; the error is checked to be distinguishable from `ErrMalformed`,
+  `ErrBadMIC`, `ErrReplay`, `ErrDuplicate` and `ErrCounterOverflow`.
+* `internal/integration/robustness_test.go` — end to end:
+  * `TestOversizedUplinkRejectedWithoutSideEffects`: oversize sends return
+    `ErrFrameTooLarge`, consume no frame counter, and the next legal
+    (exactly-max-size) send goes through with a gapless counter.
+  * `TestServerAndDeviceSurviveOversizedFrames`: oversize/malformed frames
+    injected at the server (and at the device in the downlink direction)
+    leave both processes alive, advance no counter, deliver nothing, and
+    normal confirmed traffic resumes immediately.
+  * `TestFaultyDeviceIsolatedFromHealthyDevices`: one device flooding
+    oversize+garbage frames while others join, run confirmed uplinks and
+    receive downlinks — the healthy devices are unaffected and the bad
+    frames are attributed to the faulty device alone.
+  * `TestDownlinkCounterSurvivesRestart`: after receiving a downlink, both
+    sides restart from disk (twice); the device's `FCntDown` never rolls
+    back, subsequent application downlinks and a piggybacked LinkADR MAC
+    command are still received, and every payload reaches the application
+    exactly once.
+
+Run everything locally (no external services, network or credentials):
+
+```sh
+go test -race ./...
+```

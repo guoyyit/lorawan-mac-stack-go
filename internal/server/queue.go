@@ -24,6 +24,11 @@ func (s *Server) enqueue(devEUI lorawan.EUI, q queuedDown) error {
 	if st == nil {
 		return lorawan.ErrUnknownDevice
 	}
+	// Reject payloads that can never fit in one frame, so the queue only
+	// holds encodable items. Nothing is queued and no state changes.
+	if err := lorawan.ValidateBodySize(0, len(q.payload)); err != nil {
+		return err
+	}
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	if len(st.downQ) >= s.cfg.QueueLimit {

@@ -106,7 +106,8 @@ func TestFrameRoundTripAndTamper(t *testing.T) {
 func TestDecodeMalformedNoPanic(t *testing.T) {
 	s := testDataSession()
 	for _, raw := range [][]byte{nil, {}, {0x80}, make([]byte, 17), make([]byte, 300)} {
-		if _, err := DecodeFrame(s, raw); !errors.Is(err, ErrMalformed) && !errors.Is(err, ErrBadMIC) {
+		if _, err := DecodeFrame(s, raw); !errors.Is(err, ErrMalformed) &&
+			!errors.Is(err, ErrBadMIC) && !errors.Is(err, ErrFrameTooLarge) {
 			t.Errorf("raw=%x err=%v", raw, err)
 		}
 	}

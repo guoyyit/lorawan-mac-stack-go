@@ -121,14 +121,35 @@ func DecodeJoinAccept(appKey AESKey, raw []byte) (*JoinAccept, error) {
 //	14.. FOpts
 //	..   encrypted Payload
 //	last 4  NwkSKey MIC over all preceding bytes
+//
+// The total frame size is capped at MaxFrameSize (259): the MIC's B0 block
+// carries a 1-byte length, so the signed portion may not exceed 255 bytes.
+
+// ValidateBodySize reports whether a frame body with the given FOpts and
+// payload lengths fits within MaxFrameSize. It returns ErrFrameTooLarge
+// otherwise. Both sides use it to reject oversize frames BEFORE any state
+// (frame counters, duty budget, queues) is touched.
+func ValidateBodySize(fOptsLen, payloadLen int) error {
+	if fOptsLen < 0 || payloadLen < 0 ||
+		frameHeaderSize+fOptsLen+payloadLen+micSize > MaxFrameSize {
+		return ErrFrameTooLarge
+	}
+	return nil
+}
 
 // EncodeFrame serializes, encrypts and signs a data frame for the session.
+// A frame whose FOpts+payload would exceed MaxFrameSize is rejected with
+// ErrFrameTooLarge before anything is allocated or signed.
 func EncodeFrame(s *Session, f *Frame) ([]byte, error) {
 	if s == nil || f == nil {
 		return nil, ErrMalformed
 	}
-	if len(f.FOpts) > 255 || len(f.Payload) > 65535 {
+	if len(f.FOpts) > 255 {
+		// The FOpts length byte cannot represent more than 255.
 		return nil, ErrMalformed
+	}
+	if err := ValidateBodySize(len(f.FOpts), len(f.Payload)); err != nil {
+		return nil, err
 	}
 	port := byte(0)
 	if f.HasPort {
@@ -163,9 +184,14 @@ func EncodeFrame(s *Session, f *Frame) ([]byte, error) {
 
 // DecodeFrame parses, verifies and decrypts a data frame for the session.
 // On any structural or integrity failure it returns an error and no state.
+// Length is checked first: anything over MaxFrameSize is ErrFrameTooLarge,
+// which bounds every subsequent allocation and the MIC input to 255 bytes.
 func DecodeFrame(s *Session, raw []byte) (*Frame, error) {
 	if s == nil || len(raw) < 18 {
 		return nil, ErrMalformed
+	}
+	if len(raw) > MaxFrameSize {
+		return nil, ErrFrameTooLarge
 	}
 	mt := MType(raw[0])
 	if mt != MTypeUnconfirmedDataUp && mt != MTypeUnconfirmedDataDown &&

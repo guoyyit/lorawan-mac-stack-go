@@ -68,7 +68,9 @@ func dirByte(down bool) byte {
 // LoRaWAN B0 block (direction, DevAddr, full 32-bit frame counter).
 func computeMIC(key AESKey, addr DevAddr, down bool, fcnt uint32, msg []byte) [4]byte {
 	if len(msg) > 255 {
-		// The B0 length field is one byte; the local wire format guarantees this.
+		// Internal invariant: EncodeFrame/DecodeFrame reject frames whose
+		// signed portion exceeds 255 bytes (ErrFrameTooLarge) before MIC
+		// computation, so this is unreachable from the public API.
 		panic("lorawan: frame too long for MIC")
 	}
 	var b0 [16]byte

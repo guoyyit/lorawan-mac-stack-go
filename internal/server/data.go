@@ -104,10 +104,17 @@ func (s *Server) prepareDownLocked(st *peerState, up *lorawan.Frame) (*lorawan.F
 		down.MType = lorawan.MTypeUnconfirmedDataDown
 	}
 	if hasADR {
-		down.FOpts = append(down.FOpts, lorawan.CIDLinkADRReq)
-		down.FOpts = append(down.FOpts, lorawan.MarshalLinkADRReq(st.linkADR.dr, st.linkADR.txPower)...)
-		st.linkADR = nil
-		content = true
+		fopts := append([]byte{lorawan.CIDLinkADRReq},
+			lorawan.MarshalLinkADRReq(st.linkADR.dr, st.linkADR.txPower)...)
+		// Attach the MAC command only if the whole frame still fits; a
+		// (near-)max-size queued payload takes precedence and the command
+		// stays pending for the next downlink instead of being dropped
+		// together with the payload it would have unencoded.
+		if lorawan.ValidateBodySize(len(fopts), len(down.Payload)) == nil {
+			down.FOpts = fopts
+			st.linkADR = nil
+			content = true
+		}
 	}
 
 	if content {
